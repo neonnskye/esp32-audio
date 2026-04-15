@@ -19,8 +19,8 @@ volatile int writeBuf = 0;
 volatile int writeIdx = 0;
 volatile int readyBuf = -1;
 
-portMUX_TYPE mux   = portMUX_INITIALIZER_UNLOCKED;
-hw_timer_t  *timer = NULL;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+hw_timer_t *timer = NULL;
 
 // ISR: fires at exactly 16 000 Hz, reads one ADC sample, swaps buffer when full.
 // adc1_get_raw() is called outside the spinlock to keep the critical section minimal.
@@ -75,11 +75,12 @@ void setup()
 
 void loop()
 {
-    if (readyBuf < 0) return;
+    if (readyBuf < 0)
+        return;
 
     int toSend;
     portENTER_CRITICAL(&mux);
-    toSend   = readyBuf;
+    toSend = readyBuf;
     readyBuf = -1;
     portEXIT_CRITICAL(&mux);
 
