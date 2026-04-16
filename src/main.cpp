@@ -116,4 +116,14 @@ void loop()
         // Send failed — packet not consumed, will retry next iteration
         packetsFailed++;
     }
+
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint > 5000)
+    {
+        Serial.print("Sent: ");
+        Serial.print(packetsSent);
+        Serial.print(" | Failed: ");
+        Serial.println(packetsFailed);
+        lastPrint = millis();
+    }
 }
