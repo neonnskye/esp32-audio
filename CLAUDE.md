@@ -58,7 +58,7 @@ The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer
 ### Architecture
 
 - **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of a double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
-- **`loop()`** — when a buffer is flagged ready, sends the 1024-byte payload (512 × `uint16_t`) as a single UDP packet to the configured PC IP, then calls `yield()` to allow the lwIP stack to drain its send queue.
+- **`loop()`** — when a buffer is flagged ready, sends the 1024-byte payload (512 × `uint16_t`) as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Calls `yield()` to allow the lwIP stack to drain its send queue.
 - **Double buffer** — decouples sampling from sending so the ISR never stalls waiting for UDP transmission.
 - **`esp_wifi_set_ps(WIFI_PS_NONE)`** — disables WiFi modem sleep to reduce RF interference on the ADC.
 
@@ -104,3 +104,19 @@ uv sync
 # Run
 uv run receiver.py
 ```
+
+ESP32 streams live diagnostic counts to serial: `Sent: N | Failed: N`. A rising `Failed` count indicates network or send-path issues.
+
+## Troubleshooting
+
+### `endPacket(): could not send data: 12`
+Error 12 is `ENOMEM` in lwIP — the UDP send buffer was temporarily unavailable. Root cause was a race where `readyBuf` was marked consumed *before* `endPacket()` was called, so a failed send silently dropped audio data. The fix in `loop()` retries until send succeeds.
+
+### Python receiver stays at "Waiting for N packets to pre-buffer..."
+1. Verify ESP32 and PC are on the same subnet (ESP32 streams to `PC_IP`, not broadcast)
+2. Check firewall allows UDP port 12345 inbound
+3. Confirm `PC_IP` in `src/main.cpp` matches the machine running `receiver.py`
+4. ESP32 shows `Sent:` and `Failed:` counters — `Failed` incrementing indicates send errors
+
+### Serial Output During Streaming
+ESP32 prints live counts: `Sent: N | Failed: N`. If `Failed` keeps growing, check network path to receiver.
