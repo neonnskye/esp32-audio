@@ -39,6 +39,8 @@ void IRAM_ATTR onTimer()
 }
 
 WiFiUDP udp;
+uint32_t packetsSent = 0;
+uint32_t packetsFailed = 0;
 
 void setup()
 {
@@ -60,6 +62,10 @@ void setup()
     Serial.print("Connected, IP: ");
     Serial.println(WiFi.localIP());
 
+    // Give lwIP time to populate ARP table and prepare UDP send buffers
+    Serial.println("Waiting for network to stabilize...");
+    delay(2000);
+
     // Disable WiFi modem sleep to reduce ADC interference from radio bursts
     esp_wifi_set_ps(WIFI_PS_NONE);
 
@@ -71,6 +77,10 @@ void setup()
     timerAlarmEnable(timer);
 
     Serial.println("Streaming audio...");
+    Serial.print("Sent: ");
+    Serial.print(packetsSent);
+    Serial.print(" | Failed: ");
+    Serial.println(packetsFailed);
 }
 
 void loop()
@@ -81,11 +91,29 @@ void loop()
     int toSend;
     portENTER_CRITICAL(&mux);
     toSend = readyBuf;
-    readyBuf = -1;
     portEXIT_CRITICAL(&mux);
 
-    udp.beginPacket(PC_IP, UDP_PORT);
+    if (udp.beginPacket(PC_IP, UDP_PORT) == 0)
+    {
+        // beginPacket failed — will retry next iteration
+        packetsFailed++;
+        return;
+    }
+
     udp.write((uint8_t *)buf[toSend], SAMPLES_PER_PKT * sizeof(uint16_t));
-    udp.endPacket();
-    yield();
+
+    if (udp.endPacket() != 0)
+    {
+        // Send succeeded — mark buffer as consumed
+        portENTER_CRITICAL(&mux);
+        readyBuf = -1;
+        portEXIT_CRITICAL(&mux);
+        packetsSent++;
+        yield();
+    }
+    else
+    {
+        // Send failed — packet not consumed, will retry next iteration
+        packetsFailed++;
+    }
 }
