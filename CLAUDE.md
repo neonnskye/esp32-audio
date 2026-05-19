@@ -37,7 +37,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 
 - **Microphone:** MAX9814 analog electret mic amplifier
 - **ADC pin:** GPIO 35 (ADC1 channel 7, input-only)
-- **ADC config:** 12-bit resolution, 11 dB attenuation (full 0–3.3 V range)
+- **ADC config:** 12-bit resolution, 12 dB attenuation (`ADC_ATTEN_DB_12`, full 0–3.3 V range)
 - **Sample rate:** 16 000 Hz
 
 ## Code Structure
@@ -46,7 +46,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 - [platformio.ini](platformio.ini) — board, platform, and framework config
 - [receiver.py](receiver.py) — Python UDP receiver and real-time audio playback
 - [pyproject.toml](pyproject.toml) — Python project config (managed with `uv`)
-- [lib/](lib/) — local libraries (currently empty)
+- [lib/](lib/) — local libraries; contains `elio_wake_inferencing` (Edge Impulse wake-word model)
 - [include/](include/) — shared headers (currently empty)
 - `.pio/` — generated build artifacts and downloaded lib dependencies (not edited manually)
 - `.venv/` — Python virtual environment (managed by `uv`, not edited manually)
@@ -57,8 +57,10 @@ The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer
 
 ### Architecture
 
-- **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of a double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
-- **`loop()`** — when a buffer is flagged ready, sends the 1024-byte payload (512 × `uint16_t`) as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Calls `yield()` to allow the lwIP stack to drain its send queue.
+- **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of the UDP double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
+- **Edge Impulse inference buffer** — same ISR also feeds samples (converted to `int16_t` and upscaled by 16) into a second double buffer managed by `ei_inference_t`. When a slice of `EI_CLASSIFIER_SLICE_SIZE` samples is full, `buf_ready` is flagged.
+- **`inferenceTask`** (pinned to core 0) — waits for `ei_inf.buf_ready`, calls `run_classifier_continuous()` with the completed slice, and prints per-label scores. When the `"elio"` label exceeds `0.9`, it lights `LED_BUILTIN` for 500 ms.
+- **`loop()`** (core 1) — when a UDP buffer is flagged ready, sends the 1024-byte payload as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Core 1 also hosts the WiFi/UDP stack; splitting inference to core 0 prevents EI processing from delaying packet transmission.
 - **Double buffer** — decouples sampling from sending so the ISR never stalls waiting for UDP transmission.
 - **`esp_wifi_set_ps(WIFI_PS_NONE)`** — disables WiFi modem sleep to reduce RF interference on the ADC.
 
@@ -78,10 +80,15 @@ Each packet is exactly **1024 bytes**: 512 little-endian `uint16_t` samples repr
 
 ### Python Backend
 
-The receiver lives at [receiver.py](receiver.py) in this repository. It is a two-threaded design:
+The receiver lives at [receiver.py](receiver.py) in this repository. It is a three-threaded design:
 
-- **Receive thread (`receive_loop`)** — binds UDP socket on port 12345, receives 1024-byte datagrams, decodes `uint16_t` samples to `float32` (subtract DC offset 2048, divide by 2048), applies a noise gate (mutes packets whose RMS is below `NOISE_GATE = 0.02`), and appends decoded audio to a `deque`. Drops the oldest packet when the queue exceeds `MAX_QUEUE_LEN = 10` (~320 ms of audio).
-- **sounddevice callback (`audio_callback`)** — called by `sounddevice` to fill output buffers. Drains the deque into the output array; carries leftover samples across callbacks to avoid boundary gaps. Outputs silence on underrun.
+- **Receive thread (`receive_loop`)** — binds UDP socket on port 12345, receives 1024-byte datagrams, decodes `uint16_t` samples to `float32` (subtract DC offset 2048, divide by 2048), and appends decoded audio to two queues:
+  - `packet_queue` — playback queue; packets below the noise-gate RMS are zeroed to suppress idle ADC noise.
+  - `vad_queue` — **original** (non-zeroed) audio for the VAD accumulator.
+  Drops the oldest packet when either queue exceeds its max length.
+- **VAD accumulator thread (`vad_accumulator_loop`)** — polls `vad_queue` and builds speech segments. Accumulation stops after `VAD_SILENCE_MS` of trailing silence or when the segment hits `MAX_SEGMENT_S`. Segments shorter than `VAD_MIN_SPEECH_MS` are discarded; valid segments are pushed to `transcribe_queue`.
+- **Transcription thread (`transcription_loop`)** — pulls completed segments from `transcribe_queue` and runs `faster-whisper` (`base` model, CUDA, float16, English, beam_size=1). Prints the resulting transcript.
+- **sounddevice callback (`audio_callback`)** — called by `sounddevice` to fill output buffers. Drains the `packet_queue` into the output array; carries leftover samples across callbacks to avoid boundary gaps. Outputs silence on underrun.
 - **Pre-buffering** — playback does not start until `PREBUFFER_PKTS = 3` packets (~96 ms) are queued, reducing the chance of an immediate underrun at startup.
 
 #### Python Configuration (`receiver.py` constants)
@@ -94,6 +101,12 @@ The receiver lives at [receiver.py](receiver.py) in this repository. It is a two
 | `PREBUFFER_PKTS` | `3` | Packets to queue before playback starts (~96 ms) |
 | `MAX_QUEUE_LEN` | `10` | Max queued packets before dropping oldest (~320 ms) |
 | `NOISE_GATE` | `0.02` | RMS threshold below which a packet is silenced (0 = off) |
+| `WHISPER_MODEL` | `"base"` | Whisper model size (`tiny` / `base` / `small`) |
+| `WHISPER_DEVICE` | `"cuda"` | Inference device (`cuda` or `cpu`) |
+| `WHISPER_COMPUTE` | `"float16"` | Compute precision (`float16` / `int8`) |
+| `VAD_SILENCE_MS` | `700` | Trailing silence required to end a speech segment |
+| `VAD_MIN_SPEECH_MS` | `400` | Minimum speech length; shorter segments are discarded |
+| `MAX_SEGMENT_S` | `10` | Hard cap — force transcribe even if no silence detected |
 
 #### Running the receiver
 
