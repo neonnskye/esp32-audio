@@ -46,7 +46,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 - [platformio.ini](platformio.ini) — board, platform, and framework config
 - [receiver.py](receiver.py) — Python UDP receiver and real-time audio playback
 - [pyproject.toml](pyproject.toml) — Python project config (managed with `uv`)
-- [lib/](lib/) — local libraries; contains `elio_wake_inferencing` (Edge Impulse wake-word model)
+- [lib/](lib/) — local libraries; contains `Elio_Wake_v2_inferencing` (Edge Impulse wake-word model)
 - [include/](include/) — shared headers (currently empty)
 - `.pio/` — generated build artifacts and downloaded lib dependencies (not edited manually)
 - `.venv/` — Python virtual environment (managed by `uv`, not edited manually)
@@ -59,7 +59,7 @@ The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer
 
 - **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of the UDP double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
 - **Edge Impulse inference buffer** — same ISR also feeds samples (converted to `int16_t` and upscaled by 16) into a second double buffer managed by `ei_inference_t`. When a slice of `EI_CLASSIFIER_SLICE_SIZE` samples is full, `buf_ready` is flagged.
-- **`inferenceTask`** (pinned to core 0) — waits for `ei_inf.buf_ready`, calls `run_classifier_continuous()` with the completed slice, and prints per-label scores. When the `"elio"` label exceeds `0.9`, it lights `LED_BUILTIN` for 500 ms.
+- **`inferenceTask`** (pinned to core 0) — waits for `ei_inf.buf_ready`, calls `run_classifier_continuous()` with the completed slice, and prints per-label scores. When the `"elio"` label exceeds `0.6`, it lights `LED_BUILTIN` for 500 ms.
 - **`loop()`** (core 1) — when a UDP buffer is flagged ready, sends the 1024-byte payload as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Core 1 also hosts the WiFi/UDP stack; splitting inference to core 0 prevents EI processing from delaying packet transmission.
 - **Double buffer** — decouples sampling from sending so the ISR never stalls waiting for UDP transmission.
 - **`esp_wifi_set_ps(WIFI_PS_NONE)`** — disables WiFi modem sleep to reduce RF interference on the ADC.

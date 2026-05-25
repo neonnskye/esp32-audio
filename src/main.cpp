@@ -5,7 +5,7 @@
 #include "driver/adc.h"
 
 #define EIDSP_QUANTIZE_FILTERBANK 0
-#include <elio_wake_inferencing.h>
+#include <Elio_Wake_v2_inferencing.h>
 
 // ---- User configuration ----
 #define WIFI_SSID "Amrith’s iPhone"
@@ -111,7 +111,7 @@ void inferenceTask(void *arg)
                               result.classification[i].value);
 
                 // Detect wake word — adjust label name and threshold to match yours
-                if (strcmp(result.classification[i].label, "elio") == 0 && result.classification[i].value > 0.9f)
+                if (strcmp(result.classification[i].label, "elio") == 0 && result.classification[i].value > 0.6f)
                 {
                     Serial.println(">>> WAKE WORD DETECTED <<<");
                     digitalWrite(LED_BUILTIN, HIGH);
