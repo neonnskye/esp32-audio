@@ -4,10 +4,17 @@ import threading
 import queue
 import time
 import sys
+from enum import Enum, auto
 
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
+
+class ListenState(Enum):
+    IDLE = auto()                  # waiting for wake word signal
+    SKIP_WAKEWORD_BLEED = auto()   # discarding audio bleed from the wake word utterance itself
+    CAPTURING = auto()             # actively recording the user's command
+    TRANSCRIBING = auto()          # Whisper is processing, block new captures
 
 # ---- Configuration ----
 UDP_IP          = "0.0.0.0"  # Listen on all interfaces
@@ -30,6 +37,14 @@ VAD_MIN_SPEECH_MS = 400        # ignore speech segments shorter than this
 MAX_SEGMENT_S   = 10           # hard cap — transcribe even if no silence detected
 # -----------------------
 
+# Wake word gating
+CTRL_PORT           = 12346
+BLEED_SKIP_PACKETS  = 8   # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
+
+listen_state      = ListenState.IDLE
+bleed_remaining   = 0
+state_lock        = threading.Lock()
+
 packet_queue: collections.deque = collections.deque()
 vad_queue: collections.deque = collections.deque()
 queue_lock = threading.Lock()
@@ -47,24 +62,65 @@ MIN_SPEECH_PACKETS  = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 
 
-def vad_accumulator_loop() -> None:
-    """
-    Watches packet_queue, accumulates audio into speech segments,
-    and pushes complete segments onto transcribe_queue.
-    """
-    global accumulator, silence_packets
+def control_listener() -> None:
+    """Listens on CTRL_PORT for wake word trigger packets from the ESP32."""
+    global listen_state, bleed_remaining
+
+    ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctrl_sock.bind(("0.0.0.0", CTRL_PORT))
+    print(f"Control listener ready on port {CTRL_PORT}")
 
     while True:
-        # Poll the packet queue — NEVER busy-wait while holding the lock
+        data, addr = ctrl_sock.recvfrom(16)
+        if not data or data[0] != 0x01:
+            continue
+
+        with state_lock:
+            if listen_state != ListenState.IDLE:
+                print(f"[CTRL] Wake signal received but state is {listen_state.name}, ignoring.")
+                continue
+            listen_state = ListenState.SKIP_WAKEWORD_BLEED
+            bleed_remaining = BLEED_SKIP_PACKETS
+
+        print(f"\n[WAKE] Wake word received from {addr[0]}! Skipping {BLEED_SKIP_PACKETS} packets of bleed...")
+
+
+def vad_accumulator_loop() -> None:
+    global accumulator, silence_packets, listen_state, bleed_remaining
+
+    while True:
         chunk = None
         with queue_lock:
             if vad_queue:
                 chunk = vad_queue.popleft()
 
         if chunk is None:
-            time.sleep(0.005)  # 5 ms — avoids 100% CPU spin
+            time.sleep(0.005)
             continue
 
+        with state_lock:
+            current_state = listen_state
+
+        # --- IDLE: discard everything ---
+        if current_state == ListenState.IDLE:
+            continue
+
+        # --- SKIP_WAKEWORD_BLEED: count down and discard ---
+        if current_state == ListenState.SKIP_WAKEWORD_BLEED:
+            with state_lock:
+                bleed_remaining -= 1
+                if bleed_remaining <= 0:
+                    listen_state = ListenState.CAPTURING
+                    accumulator = []
+                    silence_packets = 0
+                    print("[WAKE] Bleed skip done. Capturing command now...")
+            continue
+
+        # --- TRANSCRIBING: don't accumulate while Whisper is busy ---
+        if current_state == ListenState.TRANSCRIBING:
+            continue
+
+        # --- CAPTURING: normal VAD logic ---
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         is_speech = rms >= SILENCE_THRESHOLD
 
@@ -76,11 +132,10 @@ def vad_accumulator_loop() -> None:
             accumulator.append(chunk)
             silence_packets = 0
         else:
-            if accumulator:               # we were in speech, now trailing silence
+            if accumulator:
                 silence_packets += 1
-                accumulator.append(chunk) # include the silence tail (helps Whisper)
+                accumulator.append(chunk)
 
-        # Dispatch check runs regardless of whether current chunk is speech
         if accumulator:
             end_of_speech = (not is_speech) and (silence_packets >= SILENCE_PACKETS_MAX)
             too_long      = len(accumulator) >= MAX_SEGMENT_PACKETS
@@ -88,25 +143,34 @@ def vad_accumulator_loop() -> None:
             if end_of_speech or too_long:
                 segment = np.concatenate(accumulator)
                 if len(accumulator) >= MIN_SPEECH_PACKETS:
-                    print(f"\n[VAD] Segment ready: {len(accumulator)} packets, {len(segment)} samples, rms={rms:.4f}")
+                    print(f"\n[VAD] Segment ready: {len(accumulator)} packets, {len(segment)} samples")
+                    with state_lock:
+                        listen_state = ListenState.TRANSCRIBING
                     transcribe_queue.put(segment)
                 else:
-                    print(f"\n[VAD] Segment too short ({len(accumulator)} < {MIN_SPEECH_PACKETS}), discarding")
+                    print(f"\n[VAD] Segment too short ({len(accumulator)} pkts), discarding")
+                    with state_lock:
+                        listen_state = ListenState.IDLE
                 accumulator = []
                 silence_packets = 0
 
 def transcription_loop(model: WhisperModel) -> None:
-    """Pulls audio segments from transcribe_queue and runs Whisper."""
+    global listen_state
+
     while True:
-        segment: np.ndarray = transcribe_queue.get()  # blocks until a segment arrives
+        segment: np.ndarray = transcribe_queue.get()
 
         try:
             print(f"[transcribe] Got segment of {len(segment)} samples, transcribing...", flush=True)
-            # faster-whisper expects float32 audio at 16kHz — which is exactly what we have
             segments, info = model.transcribe(
                 segment,
-                language="en",           # set to None for auto-detect
-                beam_size=1,             # faster, slightly less accurate
+                language="en",
+                beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                word_timestamps=False,
             )
 
             text = " ".join(s.text.strip() for s in segments).strip()
@@ -114,6 +178,11 @@ def transcription_loop(model: WhisperModel) -> None:
                 print(f"[transcript] {text}")
         except Exception as exc:
             print(f"[transcribe error] {exc}", flush=True)
+        finally:
+            # Always reset to IDLE so the next wake word can be accepted
+            with state_lock:
+                listen_state = ListenState.IDLE
+            print("[STATE] Ready. Waiting for wake word...")
 
 def receive_loop(sock: socket.socket) -> None:
     """Background thread: receive UDP packets and enqueue decoded audio."""
@@ -187,6 +256,7 @@ def main() -> None:
     # Start all background threads
     for target, args in [
         (receive_loop, (sock,)),
+        (control_listener, ()),
         (vad_accumulator_loop, ()),
         (transcription_loop, (model,)),
     ]:
