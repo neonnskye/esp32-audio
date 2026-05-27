@@ -5,7 +5,18 @@
 # Usage: ./split_wav.sh [directory]
 #   directory: optional, defaults to current directory
 
-TARGET_DIR="${1:-.}"
+RAW_DIR="${1:-.}"
+
+# Convert Windows-style paths (C:\... or C:/...) to WSL Linux paths (/mnt/c/...)
+if echo "$RAW_DIR" | grep -qEi '^[a-zA-Z]:[/\\]'; then
+    DRIVE_LETTER=$(echo "$RAW_DIR" | cut -c1 | tr '[:upper:]' '[:lower:]')
+    # Strip the drive letter + colon + leading slash/backslash, then normalize slashes
+    WIN_PATH=$(echo "$RAW_DIR" | sed 's/^[a-zA-Z]:[\/\\]//' | sed 's/\\/\//g')
+    TARGET_DIR="/mnt/$DRIVE_LETTER/$WIN_PATH"
+else
+    # Normalize any remaining backslashes to forward slashes (for mixed-style input)
+    TARGET_DIR=$(echo "$RAW_DIR" | sed 's/\\/\//g')
+fi
 CLIPS_DIR="$TARGET_DIR/clips"
 
 mkdir -p "$CLIPS_DIR"
