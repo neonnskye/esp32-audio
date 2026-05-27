@@ -7,6 +7,19 @@
 
 RAW_DIR="${1:-.}"
 
+# Detect mangled Windows paths — backslashes get eaten by bash when unquoted.
+# E.g. C:\Users\foo becomes C:Usersfoo — unrecoverable.
+if echo "$RAW_DIR" | grep -qE '^[a-zA-Z]:[A-Za-z0-9_]'; then
+    echo "ERROR: The path appears to be a Windows path whose backslashes were stripped by bash." >&2
+    echo "       You passed: $1" >&2
+    echo "       Script saw: $RAW_DIR" >&2
+    echo "" >&2
+    echo "Fix: quote the path or use forward slashes:" >&2
+    echo "  ./data_prep.sh \"C:\\Users\\user\\Videos\\.elio\"" >&2
+    echo "  ./data_prep.sh C:/Users/user/Videos/.elio" >&2
+    exit 1
+fi
+
 # Convert Windows-style paths (C:\... or C:/...) to WSL Linux paths (/mnt/c/...)
 if echo "$RAW_DIR" | grep -qEi '^[a-zA-Z]:[/\\]'; then
     DRIVE_LETTER=$(echo "$RAW_DIR" | cut -c1 | tr '[:upper:]' '[:lower:]')
