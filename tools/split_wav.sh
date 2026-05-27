@@ -18,6 +18,7 @@ else
     TARGET_DIR=$(echo "$RAW_DIR" | sed 's/\\/\//g')
 fi
 CLIPS_DIR="$TARGET_DIR/clips"
+RAW_BACKUP_DIR="$TARGET_DIR/raw"
 
 mkdir -p "$CLIPS_DIR"
 
@@ -29,7 +30,33 @@ if [ ${#WAV_FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
-echo "Found ${#WAV_FILES[@]} WAV file(s). Output goes to: $CLIPS_DIR"
+echo "Found ${#WAV_FILES[@]} WAV file(s)."
+echo "-------------------------------------------"
+
+# --------------------------------------------------
+# Step 0: Convert all files to 16 kHz mono PCM
+# --------------------------------------------------
+echo ""
+echo "[0/5] Converting to 16 kHz mono PCM..."
+mkdir -p "$RAW_BACKUP_DIR"
+for f in "${WAV_FILES[@]}"; do
+    filename=$(basename "$f")
+    echo "      Resampling: $filename"
+    ffmpeg -v error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$TARGET_DIR/resampled_$filename"
+done
+
+# Move original files to raw/ backup
+echo "      Moving originals to raw/..."
+mv "$TARGET_DIR"/*.wav "$RAW_BACKUP_DIR/"
+
+# Rename resampled files to original names (remove "resampled_" prefix)
+for f in "$TARGET_DIR"/resampled_*.wav; do
+    mv "$f" "${f//resampled_/}"
+done
+
+# Re-populate WAV_FILES with the converted files
+WAV_FILES=("$TARGET_DIR"/*.wav)
+echo "      Done."
 echo "-------------------------------------------"
 
 for f in "${WAV_FILES[@]}"; do
@@ -37,22 +64,22 @@ for f in "${WAV_FILES[@]}"; do
     base="${filename%.wav}"
 
     echo ""
-    echo "[1/4] Getting duration: $filename"
+    echo "[1/5] Getting duration: $filename"
     duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")
     echo "      Duration: ${duration}s"
 
-    echo "[2/4] Padding to next whole second..."
+    echo "[2/5] Padding to next whole second..."
     # Ceiling: if duration is already a whole number, keep it; otherwise round up
     rounded=$(echo "$duration" | awk '{print int($1) == $1 ? int($1) : int($1)+1}')
     echo "      Padding to: ${rounded}s"
     padded_file="$TARGET_DIR/${base}_padded.wav"
     ffmpeg -v error -i "$f" -af "apad=pad_dur=1" -t "$rounded" "$padded_file" -y
 
-    echo "[3/4] Splitting into 1-second clips..."
+    echo "[3/5] Splitting into 1-second clips..."
     ffmpeg -v error -i "$padded_file" -f segment -segment_time 1 "$CLIPS_DIR/${base}.s%d.wav"
     rm "$padded_file"
 
-    echo "[4/4] Fixing any short clips..."
+    echo "[4/5] Fixing any short clips..."
     fixed=0
     for clip in "$CLIPS_DIR/${base}".s*.wav; do
         clip_dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$clip")
