@@ -1,9 +1,9 @@
-import socket
 import collections
-import threading
 import queue
-import time
+import socket
 import sys
+import threading
+import time
 from datetime import datetime
 from enum import Enum, auto
 
@@ -19,7 +19,9 @@ def ts() -> str:
 
 class ListenState(Enum):
     IDLE = auto()  # waiting for wake word signal
-    SKIP_WAKEWORD_BLEED = auto()  # discarding audio bleed from the wake word utterance itself
+    SKIP_WAKEWORD_BLEED = (
+        auto()
+    )  # discarding audio bleed from the wake word utterance itself
     CAPTURING = auto()  # actively recording the user's command
     TRANSCRIBING = auto()  # Whisper is processing, block new captures
 
@@ -48,7 +50,9 @@ MAX_SEGMENT_S = 10  # hard cap — transcribe even if no silence detected
 
 # Wake word gating
 CTRL_PORT = 12346
-BLEED_SKIP_PACKETS = 8  # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
+BLEED_SKIP_PACKETS = (
+    8  # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
+)
 
 listen_state = ListenState.IDLE
 bleed_remaining = 0
@@ -85,12 +89,16 @@ def control_listener() -> None:
 
         with state_lock:
             if listen_state != ListenState.IDLE:
-                print(f"{ts()} [CTRL] Wake signal received but state is {listen_state.name}, ignoring.")
+                print(
+                    f"{ts()} [CTRL] Wake signal received but state is {listen_state.name}, ignoring."
+                )
                 continue
             listen_state = ListenState.SKIP_WAKEWORD_BLEED
             bleed_remaining = BLEED_SKIP_PACKETS
 
-        print(f"\n{ts()} [WAKE] Wake word received from {addr[0]}! Skipping {BLEED_SKIP_PACKETS} packets of bleed...")
+        print(
+            f"\n{ts()} [WAKE] Wake word received from {addr[0]}! Skipping {BLEED_SKIP_PACKETS} packets of bleed..."
+        )
 
 
 def vad_accumulator_loop() -> None:
@@ -129,11 +137,13 @@ def vad_accumulator_loop() -> None:
             continue
 
         # --- CAPTURING: normal VAD logic ---
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        rms = float(np.sqrt(np.mean(chunk**2)))
         is_speech = rms >= VAD_SILENCE_THRESHOLD
 
         if rms > 0.001:
-            sys.stdout.write(f"\rVAD RMS={rms:.4f} speech={is_speech} acc_len={len(accumulator)} ")
+            sys.stdout.write(
+                f"\rVAD RMS={rms:.4f} speech={is_speech} acc_len={len(accumulator)} "
+            )
             sys.stdout.flush()
 
         if is_speech:
@@ -151,12 +161,16 @@ def vad_accumulator_loop() -> None:
             if end_of_speech or too_long:
                 segment = np.concatenate(accumulator)
                 if len(accumulator) >= MIN_SPEECH_PACKETS:
-                    print(f"\n{ts()} [VAD] Segment ready: {len(accumulator)} packets, {len(segment)} samples")
+                    print(
+                        f"\n{ts()} [VAD] Segment ready: {len(accumulator)} packets, {len(segment)} samples"
+                    )
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
                     transcribe_queue.put(segment)
                 else:
-                    print(f"\n{ts()} [VAD] Segment too short ({len(accumulator)} pkts), discarding")
+                    print(
+                        f"\n{ts()} [VAD] Segment too short ({len(accumulator)} pkts), discarding"
+                    )
                     with state_lock:
                         listen_state = ListenState.IDLE
                 accumulator = []
@@ -170,7 +184,10 @@ def transcription_loop(model: WhisperModel) -> None:
         segment: np.ndarray = transcribe_queue.get()
 
         try:
-            print(f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing...", flush=True)
+            print(
+                f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing...",
+                flush=True,
+            )
             segments, info = model.transcribe(
                 segment,
                 language="en",
@@ -207,7 +224,7 @@ def receive_loop(sock: socket.socket) -> None:
 
         # Noise gate: only applies to playback if you want to suppress idle hiss.
         # For full-fidelity recording/monitoring, set NOISE_GATE = 0 or remove this block.
-        if NOISE_GATE > 0 and np.sqrt(np.mean(audio ** 2)) < NOISE_GATE:
+        if NOISE_GATE > 0 and np.sqrt(np.mean(audio**2)) < NOISE_GATE:
             playback_audio = np.zeros(SAMPLES_PER_PKT, dtype=np.float32)
         else:
             playback_audio = audio
@@ -215,7 +232,7 @@ def receive_loop(sock: socket.socket) -> None:
         with queue_lock:
             if len(packet_queue) >= MAX_QUEUE_LEN:
                 packet_queue.popleft()
-            packet_queue.append(playback_audio)   # <-- was using gated audio
+            packet_queue.append(playback_audio)  # <-- was using gated audio
             vad_queue.append(audio)
             if len(vad_queue) > MAX_QUEUE_LEN * 4:
                 vad_queue.popleft()
@@ -232,7 +249,7 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
     # Use leftover samples from previous callback first
     if len(leftover) > 0:
         use = min(len(leftover), needed)
-        output[write_pos:write_pos + use] = leftover[:use]
+        output[write_pos : write_pos + use] = leftover[:use]
         leftover = leftover[use:]
         write_pos += use
         needed -= use
@@ -244,12 +261,12 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
                 break  # note: should be break, not continue
             chunk = packet_queue.popleft()
         if len(chunk) <= needed:
-            output[write_pos:write_pos + len(chunk)] = chunk
+            output[write_pos : write_pos + len(chunk)] = chunk
             write_pos += len(chunk)
             needed -= len(chunk)
         else:
             # Chunk is larger than remaining space — save the tail for next callback
-            output[write_pos:write_pos + needed] = chunk[:needed]
+            output[write_pos : write_pos + needed] = chunk[:needed]
             leftover = chunk[needed:]
             needed = 0
 
@@ -258,7 +275,9 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
 
 def main() -> None:
     print(f"{ts()} Loading Whisper model '{WHISPER_MODEL}'...")
-    model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+    model = WhisperModel(
+        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
+    )
     print(f"{ts()} Model loaded.")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -283,11 +302,11 @@ def main() -> None:
 
     print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
     with sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=audio_callback,
-            blocksize=SAMPLES_PER_PKT,
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        callback=audio_callback,
+        blocksize=SAMPLES_PER_PKT,
     ):
         try:
             while True:
