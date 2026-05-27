@@ -33,8 +33,6 @@ fi
 CLIPS_DIR="$TARGET_DIR/clips"
 RAW_BACKUP_DIR="$TARGET_DIR/raw"
 
-mkdir -p "$CLIPS_DIR"
-
 shopt -s nullglob
 WAV_FILES=("$TARGET_DIR"/*.wav)
 
@@ -58,9 +56,11 @@ for f in "${WAV_FILES[@]}"; do
     ffmpeg -v error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$TARGET_DIR/resampled_$filename"
 done
 
-# Move original files to raw/ backup
+# Move original files to raw/ backup (only the pre-conversion files, not the resampled_ ones)
 echo "      Moving originals to raw/..."
-mv "$TARGET_DIR"/*.wav "$RAW_BACKUP_DIR/"
+for f in "${WAV_FILES[@]}"; do
+    mv "$f" "$RAW_BACKUP_DIR/"
+done
 
 # Rename resampled files to original names (remove "resampled_" prefix)
 for f in "$TARGET_DIR"/resampled_*.wav; do
@@ -78,6 +78,7 @@ read -p "Split converted files into 1-second clips? [y/N] " SPLIT_ANSWER
 case "$SPLIT_ANSWER" in
     [yY]|[yY][eE][sS])
         echo "Proceeding with splitting..."
+        mkdir -p "$CLIPS_DIR"
         ;;
     *)
         echo "Skipping split. Converted files are in: $TARGET_DIR"
