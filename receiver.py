@@ -240,9 +240,16 @@ def transcription_loop() -> None:
             )
             if text:
                 print(f"{ts()} [transcript] {text}")
-                with state_lock:
-                    listen_state = ListenState.RESPONDING
-                llm_queue.put(text)
+                word_count = len(text.split())
+                if word_count <= 3:
+                    print(
+                        f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
+                    )
+                    # fall through to IDLE reset, don't enqueue
+                else:
+                    with state_lock:
+                        listen_state = ListenState.RESPONDING
+                    llm_queue.put(text)
         except Exception as exc:
             print(f"{ts()} [transcribe error] {exc}", flush=True)
         finally:
