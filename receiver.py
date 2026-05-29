@@ -388,6 +388,31 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+# Sentence splitting regex for streaming LLM output
+# Prevents splitting on common abbreviations, numbers, or initials
+ABBREV = (
+    r"(?<!\bMr)(?<!\bMrs)(?<!\bDr)(?<!\bSt)"
+    r"(?<!\bvs)(?<!\betc)(?<!\be\.g)(?<!\bi\.e)"
+)
+NOT_INITIALS = r"(?<![A-Z])"
+SENTENCE_END = re.compile(ABBREV + NOT_INITIALS + r"(?:[.!?](?=\s|$)|\.\.\.(?=\s))")
+
+
+def split_sentences(buffer: str) -> tuple[list[str], str]:
+    """
+    Extract complete sentences from buffer.
+    Returns (ready_sentences, leftover_fragment).
+    """
+    sentences = []
+    pos = 0
+    for match in SENTENCE_END.finditer(buffer):
+        end = match.end()
+        sentences.append(buffer[pos:end])
+        pos = end
+    leftover = buffer[pos:]
+    return sentences, leftover
+
+
 def llm_loop() -> None:
     global listen_state
 
@@ -423,6 +448,7 @@ def llm_loop() -> None:
 
             print(f"{ts()} [LLM] ", end="", flush=True)
             collected = ""
+            buffer = ""
             stream_start = time.monotonic()
             last_token_time = time.monotonic()
 
@@ -450,9 +476,17 @@ def llm_loop() -> None:
                 token = chunk.choices[0].delta.content or ""
                 if token:
                     collected += token
+                    buffer += token
                     last_token_time = time.monotonic()
                     sys.stdout.write(token)
                     sys.stdout.flush()
+
+                    sentences, buffer = split_sentences(buffer)
+                    for sentence in sentences:
+                        clean = strip_markdown(sentence).strip()
+                        if clean:
+                            tts_queue.put(clean)
+                            tts_queued = True
 
             if timed_out:
                 with state_lock:
@@ -460,16 +494,19 @@ def llm_loop() -> None:
                 print(f"{ts()} [STATE] Ready. Waiting for wake word...")
                 continue
 
-            # Sanitize the full response for TTS-friendly output
+            # Flush any remaining text in the buffer as a final sentence
+            if buffer.strip():
+                clean = strip_markdown(buffer).strip()
+                if clean:
+                    tts_queue.put(clean)
+                    tts_queued = True
+
+            # Log the full response for debugging
             sanitized = strip_markdown(collected)
             if sanitized != collected:
                 print(f"\n{ts()} [LLM] Sanitized: {sanitized}")
             else:
                 print()  # newline after streamed response
-
-            if sanitized.strip():
-                tts_queue.put(sanitized.strip())
-                tts_queued = True
 
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
@@ -629,16 +666,16 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
                 if not response_queue:
                     break
                 if response_queue[0] is None:
-                    response_queue.popleft()
-                    is_responding = False
-                chunk = response_queue.popleft() if response_queue else None
-
-            if chunk is None:
-                # Sentinel consumed: TTS playback complete
-                leftover = np.zeros(0, dtype=np.float32)
-                with state_lock:
-                    listen_state = ListenState.IDLE
-                break
+                    response_queue.popleft()  # discard this sentinel
+                    # Only stop if there's nothing else queued
+                    if not response_queue:
+                        is_responding = False
+                        leftover = np.zeros(0, dtype=np.float32)
+                        with state_lock:
+                            listen_state = ListenState.IDLE
+                    # Either way, stop filling this callback frame
+                    break
+                chunk = response_queue.popleft()
 
             if len(chunk) <= needed:
                 output[write_pos : write_pos + len(chunk)] = chunk
