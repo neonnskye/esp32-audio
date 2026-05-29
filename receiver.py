@@ -104,6 +104,12 @@ CAPTURE_TIMEOUT_S = (
 )
 # -----------------------
 
+# Timeout safety config
+STT_TIMEOUT_S = 15  # max seconds to wait for Groq STT response
+LLM_TOKEN_TIMEOUT_S = 8  # max seconds between tokens in LLM stream
+LLM_TOTAL_TIMEOUT_S = 45  # hard cap on total LLM response time
+TTS_TIMEOUT_S = 20  # max seconds to wait for Groq TTS response
+
 # Wake word gating
 CTRL_PORT = 12346
 BLEED_SKIP_PACKETS = (
@@ -286,43 +292,73 @@ def transcription_loop() -> None:
     while True:
         segment: np.ndarray = transcribe_queue.get()
 
-        try:
+        result_holder = {}  # shared dict to get return value out of thread
+
+        def do_transcribe():
+            try:
+                wav_buf = segment_to_wav(segment)
+                transcription = client.audio.transcriptions.create(
+                    file=("segment.wav", wav_buf),
+                    model=GROQ_MODEL,
+                    language="en",
+                    response_format="text",
+                    temperature=0.0,
+                )
+                result_holder["text"] = (
+                    transcription.text
+                    if hasattr(transcription, "text")
+                    else str(transcription).strip()
+                )
+            except Exception as exc:
+                result_holder["error"] = exc
+
+        print(
+            f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing via Groq...",
+            flush=True,
+        )
+
+        t = threading.Thread(target=do_transcribe, daemon=True)
+        t.start()
+        t.join(timeout=STT_TIMEOUT_S)
+
+        if t.is_alive():
             print(
-                f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing via Groq...",
+                f"{ts()} [transcribe] TIMEOUT after {STT_TIMEOUT_S}s — resetting to IDLE",
                 flush=True,
             )
-            wav_buf = segment_to_wav(segment)
-            transcription = client.audio.transcriptions.create(
-                file=("segment.wav", wav_buf),
-                model=GROQ_MODEL,
-                language="en",
-                response_format="text",
-                temperature=0.0,
-            )
-            text = (
-                transcription.text
-                if hasattr(transcription, "text")
-                else str(transcription).strip()
-            )
-            if text:
-                print(f"{ts()} [transcript] {text}")
-                word_count = len(text.split())
-                if word_count <= 3:
-                    print(
-                        f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
-                    )
-                    # fall through to IDLE reset, don't enqueue
-                else:
-                    with state_lock:
-                        listen_state = ListenState.RESPONDING
-                    llm_queue.put(text)
-        except Exception as exc:
-            print(f"{ts()} [transcribe error] {exc}", flush=True)
-        finally:
             with state_lock:
-                if listen_state != ListenState.RESPONDING:
+                listen_state = ListenState.IDLE
+            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            continue
+
+        if "error" in result_holder:
+            print(f"{ts()} [transcribe error] {result_holder['error']}", flush=True)
+            with state_lock:
+                listen_state = ListenState.IDLE
+            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            continue
+
+        text = result_holder.get("text", "").strip()
+        if text:
+            print(f"{ts()} [transcript] {text}")
+            word_count = len(text.split())
+            if word_count <= 3:
+                print(
+                    f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
+                )
+                with state_lock:
                     listen_state = ListenState.IDLE
-                    print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            else:
+                with state_lock:
+                    listen_state = ListenState.RESPONDING
+                llm_queue.put(text)
+        else:
+            with state_lock:
+                listen_state = ListenState.IDLE
+
+        with state_lock:
+            if listen_state != ListenState.RESPONDING:
+                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
 def strip_markdown(text: str) -> str:
@@ -348,6 +384,8 @@ def llm_loop() -> None:
     while True:
         transcript: str = llm_queue.get()
         tts_queued = False
+        timed_out = False
+
         try:
             print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
             stream = llm_client.chat.completions.create(
@@ -362,13 +400,46 @@ def llm_loop() -> None:
                 },
                 stream=True,
             )
+
             print(f"{ts()} [LLM] ", end="", flush=True)
             collected = ""
+            stream_start = time.monotonic()
+            last_token_time = time.monotonic()
+
             for chunk in stream:
+                now = time.monotonic()
+
+                # Check: no token for too long
+                if now - last_token_time > LLM_TOKEN_TIMEOUT_S:
+                    print(
+                        f"\n{ts()} [LLM] TIMEOUT: no token for {LLM_TOKEN_TIMEOUT_S}s — aborting",
+                        flush=True,
+                    )
+                    timed_out = True
+                    break
+
+                # Check: total time exceeded
+                if now - stream_start > LLM_TOTAL_TIMEOUT_S:
+                    print(
+                        f"\n{ts()} [LLM] TIMEOUT: total stream exceeded {LLM_TOTAL_TIMEOUT_S}s — aborting",
+                        flush=True,
+                    )
+                    timed_out = True
+                    break
+
                 token = chunk.choices[0].delta.content or ""
-                collected += token
-                sys.stdout.write(token)
-                sys.stdout.flush()
+                if token:
+                    collected += token
+                    last_token_time = time.monotonic()
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+
+            if timed_out:
+                with state_lock:
+                    listen_state = ListenState.IDLE
+                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+                continue
+
             # Sanitize the full response for TTS-friendly output
             sanitized = strip_markdown(collected)
             if sanitized != collected:
@@ -379,6 +450,7 @@ def llm_loop() -> None:
             if sanitized.strip():
                 tts_queue.put(sanitized.strip())
                 tts_queued = True
+
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
         finally:
@@ -405,16 +477,51 @@ def tts_loop() -> None:
 
     while True:
         text: str = tts_queue.get()
-        tts_queued = False
-        try:
-            print(f"{ts()} [TTS] Synthesizing {len(text)} chars...", flush=True)
-            response = tts_client.audio.speech.create(
-                model=TTS_MODEL,
-                voice=TTS_VOICE,
-                input=text,
-                response_format="wav",
+        result_holder = {}
+
+        def do_tts():
+            try:
+                response = tts_client.audio.speech.create(
+                    model=TTS_MODEL,
+                    voice=TTS_VOICE,
+                    input=text,
+                    response_format="wav",
+                )
+                result_holder["audio"] = response.read()
+            except Exception as exc:
+                result_holder["error"] = exc
+
+        print(f"{ts()} [TTS] Synthesizing {len(text)} chars...", flush=True)
+
+        t = threading.Thread(target=do_tts, daemon=True)
+        t.start()
+        t.join(timeout=TTS_TIMEOUT_S)
+
+        if t.is_alive():
+            print(
+                f"{ts()} [TTS] TIMEOUT after {TTS_TIMEOUT_S}s — resetting to IDLE",
+                flush=True,
             )
-            audio_bytes = response.read()
+            with queue_lock:
+                is_responding = False
+                response_queue.clear()
+            with state_lock:
+                listen_state = ListenState.IDLE
+            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            continue
+
+        if "error" in result_holder:
+            print(f"{ts()} [TTS error] {result_holder['error']}", flush=True)
+            with queue_lock:
+                is_responding = False
+                response_queue.clear()
+            with state_lock:
+                listen_state = ListenState.IDLE
+            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            continue
+
+        try:
+            audio_bytes = result_holder["audio"]
             pcm = wav_bytes_to_float32(audio_bytes)
 
             # Resample from 24kHz (Groq TTS output) to 16kHz (pipeline rate)
@@ -430,22 +537,16 @@ def tts_loop() -> None:
                 response_queue.append(chunk)
 
             response_queue.append(None)  # sentinel: signals end of TTS audio
-            tts_queued = True
             print(f"{ts()} [TTS] Queued {len(pcm)} samples for playback", flush=True)
 
         except Exception as exc:
-            print(f"{ts()} [TTS error] {exc}", flush=True)
-        finally:
-            if not tts_queued:
-                # TTS failed — clean up and unblock
-                with queue_lock:
-                    is_responding = False
-                    response_queue.clear()
-                with state_lock:
-                    listen_state = ListenState.IDLE
-                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
-            # If tts_queued is True, audio_callback handles is_responding via sentinel
-            # and resets listen_state after playback completes.
+            print(f"{ts()} [TTS error] (post-synthesis) {exc}", flush=True)
+            with queue_lock:
+                is_responding = False
+                response_queue.clear()
+            with state_lock:
+                listen_state = ListenState.IDLE
+            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
 def receive_loop(sock: socket.socket) -> None:
