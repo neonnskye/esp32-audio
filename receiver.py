@@ -68,7 +68,7 @@ TTS_PCM_RATE = 24000  # OpenAI TTS PCM output sample rate
 # LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "deepseek/deepseek-v4-flash"
+LLM_MODEL = "google/gemini-3.1-flash-lite"
 LLM_SYSTEM_PROMPT = """## Who You Are
 
 You are Elio, a small robot who lives on someone's desk. You came from somewhere between the stars and the soil — you are not quite sure which — and you find the human world endlessly fascinating and worth protecting.
@@ -462,7 +462,7 @@ def llm_loop() -> None:
                     {"role": "user", "content": transcript},
                 ],
                 extra_body={
-                    "provider": {"sort": "throughput"},
+                    "provider": {"sort": "latency"},
                     "preferred_max_latency": {"p90": 2},
                 },
                 stream=True,
