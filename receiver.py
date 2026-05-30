@@ -154,6 +154,9 @@ STT_TIMEOUT_S = 15  # max seconds to wait for Groq STT response
 LLM_TOKEN_TIMEOUT_S = 8  # max seconds between tokens in LLM stream
 LLM_TOTAL_TIMEOUT_S = 45  # hard cap on total LLM response time
 TTS_TIMEOUT_S = 20  # max seconds to wait for TTS response
+CONVERSATION_HISTORY_MAX_TURNS = (
+    20  # max message objects in history (20 = ~10 exchanges)
+)
 
 # Wake word gating
 CTRL_PORT = 12346
@@ -186,6 +189,10 @@ transcribe_queue: queue.Queue = queue.Queue()
 
 # Shutdown coordination
 shutdown_event = threading.Event()
+
+# Conversation history for LLM context across voice turns
+conversation_history: list[dict] = []
+history_lock = threading.Lock()
 
 # UDP socket for sending TTS audio to ESP32
 audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -467,7 +474,7 @@ def split_sentences(buffer: str) -> tuple[list[str], str]:
 
 
 def llm_loop() -> None:
-    global listen_state
+    global listen_state, conversation_history
 
     llm_client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
@@ -484,14 +491,18 @@ def llm_loop() -> None:
         tts_queued = False
         timed_out = False
 
+        # Append user transcript to conversation history
+        with history_lock:
+            conversation_history.append({"role": "user", "content": transcript})
+
         try:
             print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
             stream = llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": transcript},
-                ],
+                ]
+                + conversation_history,
                 extra_body={
                     "provider": {"sort": "throughput"},
                     "preferred_max_latency": {"p90": 2},
@@ -542,6 +553,13 @@ def llm_loop() -> None:
                             tts_queued = True
 
             if timed_out:
+                # Stream timed out — don't commit assistant reply; remove user turn
+                with history_lock:
+                    if (
+                        conversation_history
+                        and conversation_history[-1]["role"] == "user"
+                    ):
+                        conversation_history.pop()
                 with state_lock:
                     listen_state = ListenState.IDLE
                 print(f"{ts()} [STATE] Ready. Waiting for wake word...")
@@ -561,8 +579,28 @@ def llm_loop() -> None:
             else:
                 print()  # newline after streamed response
 
+            # Commit assistant reply to history (only if we have a real response)
+            if collected:
+                with history_lock:
+                    conversation_history.append(
+                        {"role": "assistant", "content": collected}
+                    )
+                    # Cap history to prevent unbounded context growth
+                    if len(conversation_history) > CONVERSATION_HISTORY_MAX_TURNS:
+                        # Keep only the most recent N message objects (system prompt is separate)
+                        conversation_history[:] = conversation_history[
+                            -CONVERSATION_HISTORY_MAX_TURNS:
+                        ]
+                    print(
+                        f"{ts()} [LLM] History: {len(conversation_history)} messages stored."
+                    )
+
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
+            # Roll back the dangling user turn — no assistant reply was stored
+            with history_lock:
+                if conversation_history and conversation_history[-1]["role"] == "user":
+                    conversation_history.pop()
         finally:
             if not tts_queued:
                 with state_lock:
