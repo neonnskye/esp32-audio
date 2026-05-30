@@ -49,6 +49,7 @@ VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered
 AUDIO_OUTPUT = "esp32"  # "local" | "esp32" | "both"
 ESP32_IP = "172.20.10.3"  # must match IP printed by ESP32 on boot — adjust if different
 ESP32_AUDIO_PORT = 12347
+ESP32_CTRL_TX_PORT = 12348  # ESP32 listens here for PC → ESP32 control bytes
 AUDIO_SEND_CHUNK = 512  # samples per UDP packet
 AUDIO_SEND_RATE = 16000  # Hz
 AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pacing
@@ -328,6 +329,10 @@ def vad_accumulator_loop() -> None:
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
                     transcribe_queue.put(segment)
+                    # Notify ESP32 that speech has ended — triggers the "thinking" chime
+                    audio_send_sock.sendto(
+                        bytes([0x02]), (ESP32_IP, ESP32_CTRL_TX_PORT)
+                    )
                 else:
                     print(
                         f"\n{ts()} [VAD] Segment too short ({len(accumulator)} pkts), discarding"
