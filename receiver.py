@@ -649,12 +649,17 @@ def tts_loop() -> None:
             up = AUDIO_SEND_RATE // g
             down = src_rate // g
 
-            print(f"{ts()} [TTS] WAV sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz", flush=True)
+            print(
+                f"{ts()} [TTS] WAV sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz",
+                flush=True,
+            )
 
             pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
 
             # Convert to int16 for routing to ESP32 and/or local playback
-            pcm_int16 = (pcm_resampled * 32767).clip(-32768, 32767).astype(np.int16)
+            pcm_int16 = (
+                (pcm_resampled * 0.95 * 32767).clip(-32768, 32767).astype(np.int16)
+            )
 
             play_audio(pcm_int16)
             print(
