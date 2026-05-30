@@ -57,8 +57,12 @@ AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pa
 GROQ_MODEL = "whisper-large-v3-turbo"
 
 # TTS config
-TTS_MODEL = "canopylabs/orpheus-v1-english"
-TTS_VOICE = "autumn"
+TTS_MODEL = "openai/gpt-4o-mini-tts-2025-12-15"
+TTS_VOICE = "nova"
+TTS_REFERER = (
+    "https://github.com/neonnskye/esp32-audio"  # Optional, for OpenRouter rankings
+)
+TTS_TITLE = "Elio"  # Optional, for OpenRouter rankings
 
 # LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -117,7 +121,7 @@ CAPTURE_TIMEOUT_S = (
 STT_TIMEOUT_S = 15  # max seconds to wait for Groq STT response
 LLM_TOKEN_TIMEOUT_S = 8  # max seconds between tokens in LLM stream
 LLM_TOTAL_TIMEOUT_S = 45  # hard cap on total LLM response time
-TTS_TIMEOUT_S = 20  # max seconds to wait for Groq TTS response
+TTS_TIMEOUT_S = 20  # max seconds to wait for TTS response
 
 # Wake word gating
 CTRL_PORT = 12346
@@ -608,7 +612,10 @@ def audio_dispatch_loop() -> None:
 def tts_loop() -> None:
     global listen_state, is_responding
 
-    tts_client = Groq()
+    tts_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
 
     while not shutdown_event.is_set():
         try:
@@ -621,13 +628,20 @@ def tts_loop() -> None:
 
         def do_tts():
             try:
-                response = tts_client.audio.speech.create(
+                with tts_client.audio.speech.with_streaming_response.create(
+                    extra_headers={
+                        "HTTP-Referer": TTS_REFERER,
+                        "X-OpenRouter-Title": TTS_TITLE,
+                    },
                     model=TTS_MODEL,
                     voice=TTS_VOICE,
                     input=text,
                     response_format="wav",
-                )
-                result_holder["audio"] = response.read()
+                ) as response:
+                    buf = io.BytesIO()
+                    for chunk in response.iter_bytes():
+                        buf.write(chunk)
+                    result_holder["audio"] = buf.getvalue()
             except Exception as exc:
                 result_holder["error"] = exc
 
@@ -802,7 +816,9 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
 
 
 def main() -> None:
-    print(f"{ts()} Using Groq API model '{GROQ_MODEL}'")
+    print(
+        f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
