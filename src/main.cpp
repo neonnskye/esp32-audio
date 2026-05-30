@@ -3,6 +3,7 @@
 #include <WiFiUDP.h>
 #include "esp_wifi.h"
 #include "driver/adc.h"
+#include <driver/i2s.h>
 
 #define EIDSP_QUANTIZE_FILTERBANK 0
 #include <Elio_Wake_v3_inferencing.h>
@@ -13,6 +14,8 @@
 #define PC_IP "172.20.10.5"
 #define UDP_PORT 12345
 #define CTRL_UDP_PORT 12346
+#define AUDIO_RX_PORT 12347    // PC sends TTS audio back to this port
+#define PLAYBACK_VOLUME_PCT 90 // volume scale applied to each sample (out of 100)
 // ----------------------------
 
 #define SAMPLES_PER_PKT 512
@@ -25,6 +28,8 @@ volatile int readyBuf = -1;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t *timer = NULL;
+
+volatile bool isSpeaking = false;
 
 // EI inference double-buffer (fed from the timer ISR, consumed by inference task)
 typedef struct
@@ -141,13 +146,60 @@ void inferenceTask(void *arg)
                     ledOffAt = millis() + 500; // schedule off, don't block
 
                     // Notify Python server that wake word was detected
-                    uint8_t trigByte = 0x01;
-                    ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
-                    ctrlUdp.write(&trigByte, 1);
-                    ctrlUdp.endPacket();
+                    // Suppress the trigger while ESP32 is playing its own audio
+                    // (prevents acoustic feedback through the microphone)
+                    if (!isSpeaking)
+                    {
+                        uint8_t trigByte = 0x01;
+                        ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
+                        ctrlUdp.write(&trigByte, 1);
+                        ctrlUdp.endPacket();
+                    }
                 }
             }
             print_results = 0;
+        }
+    }
+}
+
+void audioPlaybackTask(void *arg)
+{
+    WiFiUDP audioRxUdp;
+    audioRxUdp.begin(AUDIO_RX_PORT);
+
+    int16_t rxBuf[SAMPLES_PER_PKT];
+    int16_t stereoBuf[SAMPLES_PER_PKT * 2];
+    uint32_t lastPacketMs = 0;
+
+    while (true)
+    {
+        int packetSize = audioRxUdp.parsePacket();
+
+        if (packetSize > 0)
+        {
+            int bytesRead = audioRxUdp.read((uint8_t *)rxBuf, sizeof(rxBuf));
+            int samplesRead = bytesRead / sizeof(int16_t);
+
+            isSpeaking = true;
+            lastPacketMs = millis();
+
+            for (int i = 0; i < samplesRead; i++)
+            {
+                int16_t s = (int16_t)((int32_t)rxBuf[i] * PLAYBACK_VOLUME_PCT / 100);
+                stereoBuf[i * 2] = s;
+                stereoBuf[i * 2 + 1] = s;
+            }
+
+            size_t bytesWritten;
+            i2s_write(I2S_NUM_0, stereoBuf, samplesRead * 4, &bytesWritten, portMAX_DELAY);
+        }
+        else
+        {
+            if (isSpeaking && (millis() - lastPacketMs > 200))
+            {
+                isSpeaking = false;
+            }
+            delay(1);
         }
     }
 }
@@ -194,8 +246,37 @@ void setup()
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
+    // Initialize I2S for audio playback (MAX98357 amp)
+    // 16-bit 16 kHz mono, duplicated to both stereo channels
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = SAMPLES_PER_PKT,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = 26,
+        .ws_io_num = 25,
+        .data_out_num = 22,
+        .data_in_num = I2S_PIN_NO_CHANGE,
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+
     // Start inference task on core 0 (WiFi/UDP runs on core 1 by default)
     xTaskCreatePinnedToCore(inferenceTask, "EI_Infer", 1024 * 48, NULL, 1, &inferenceTaskHandle, 0);
+
+    // Start audio playback task on core 1 (same as WiFi — spends most time blocked on UDP recv)
+    xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 2, NULL, 1);
 
     // Timer 0: 80 MHz / prescaler 5 = 16 MHz base clock
     // Alarm at 1000 counts → 16 MHz / 1000 = exactly 16 000 Hz
