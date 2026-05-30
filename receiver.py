@@ -140,6 +140,11 @@ is_responding: bool = False
 # TTS queue for LLM responses to be spoken aloud
 tts_queue: queue.Queue = queue.Queue()
 
+# Queue for completed TTS audio (decouples synthesis from playback dispatch)
+audio_queue: collections.deque = collections.deque()
+audio_queue_lock = threading.Lock()
+audio_queue_event = threading.Event()
+
 # A separate queue to pass completed audio segments to the transcription thread
 transcribe_queue: queue.Queue = queue.Queue()
 
@@ -584,6 +589,22 @@ def play_audio(pcm_int16: np.ndarray) -> None:
         send_audio_esp32(pcm_int16)
 
 
+def audio_dispatch_loop() -> None:
+    """Drain audio_queue and dispatch each sentence for playback.
+    Runs in its own daemon thread, decoupled from TTS synthesis so the
+    next sentence can be synthesised while the current one plays.
+    """
+    while not shutdown_event.is_set():
+        audio_queue_event.wait(timeout=0.1)
+        while True:
+            with audio_queue_lock:
+                if not audio_queue:
+                    break
+                pcm_int16 = audio_queue.popleft()
+            play_audio(pcm_int16)
+        audio_queue_event.clear()
+
+
 def tts_loop() -> None:
     global listen_state, is_responding
 
@@ -661,7 +682,9 @@ def tts_loop() -> None:
                 (pcm_resampled * 0.95 * 32767).clip(-32768, 32767).astype(np.int16)
             )
 
-            play_audio(pcm_int16)
+            with audio_queue_lock:
+                audio_queue.append(pcm_int16)
+            audio_queue_event.set()
             print(
                 f"{ts()} [TTS] Queued {len(pcm_resampled)} samples for playback ({AUDIO_OUTPUT})",
                 flush=True,
@@ -795,6 +818,7 @@ def main() -> None:
         (transcription_loop, ()),
         (llm_loop, ()),
         (tts_loop, ()),
+        (audio_dispatch_loop, ()),
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
