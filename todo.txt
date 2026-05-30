@@ -1,0 +1,5 @@
+[audio]
+play sound on elio + thinking
+background voices interfering with VAD
+INMP441
+rhythm detection
