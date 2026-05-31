@@ -628,13 +628,24 @@ def wav_bytes_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
 
 
 def send_audio_esp32(pcm_int16: np.ndarray) -> None:
-    """Send int16 PCM audio to the ESP32 over UDP, paced to real-time."""
+    """Send int16 PCM audio to the ESP32 over UDP, paced to real-time.
+    Uses deadline-based timing instead of sleep() to avoid drift.
+    """
+    chunk_duration = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s
+    deadline = time.monotonic()
+
     for i in range(0, len(pcm_int16), AUDIO_SEND_CHUNK):
         chunk = pcm_int16[i : i + AUDIO_SEND_CHUNK]
         if len(chunk) < AUDIO_SEND_CHUNK:
             chunk = np.pad(chunk, (0, AUDIO_SEND_CHUNK - len(chunk)))
         audio_send_sock.sendto(chunk.tobytes(), (ESP32_IP, ESP32_AUDIO_PORT))
-        time.sleep(AUDIO_SEND_SLEEP)
+
+        deadline += chunk_duration
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining > 0:
+            time.sleep(remaining)
+        # If remaining < 0, we're behind — skip sleep, catch up immediately
 
 
 def send_chime_stop() -> None:

@@ -207,8 +207,12 @@ void audioPlaybackTask(void *arg)
     WiFiUDP audioRxUdp;
     audioRxUdp.begin(AUDIO_RX_PORT);
 
-    int16_t rxBuf[SAMPLES_PER_PKT];
-    int16_t stereoBuf[SAMPLES_PER_PKT * 2];
+    // Jitter buffer: hold this many packets before we start draining
+    const int JITTER_BUFFER_PKTS = 3; // ~96ms at 16kHz/512 samples
+    static int16_t jitterBuf[JITTER_BUFFER_PKTS][SAMPLES_PER_PKT];
+    static int16_t stereoBuf[SAMPLES_PER_PKT * 2];
+    int buffered = 0;
+    bool playing = false;
     uint32_t lastPacketMs = 0;
 
     while (true)
@@ -217,24 +221,48 @@ void audioPlaybackTask(void *arg)
 
         if (packetSize > 0)
         {
+            int16_t rxBuf[SAMPLES_PER_PKT];
             int bytesRead = audioRxUdp.read((uint8_t *)rxBuf, sizeof(rxBuf));
             int samplesRead = bytesRead / sizeof(int16_t);
 
             if (chimeLooping)
-            {
                 chimeLooping = false;
-            }
-
             isSpeaking = true;
             lastPacketMs = millis();
 
+            // Scale volume
             for (int i = 0; i < samplesRead; i++)
+                rxBuf[i] = (int16_t)((int32_t)rxBuf[i] * PLAYBACK_VOLUME_PCT / 100);
+
+            if (!playing)
             {
-                int16_t s = (int16_t)((int32_t)rxBuf[i] * PLAYBACK_VOLUME_PCT / 100);
-                stereoBuf[i * 2] = s;
-                stereoBuf[i * 2 + 1] = s;
+                // Pre-fill jitter buffer before starting playback
+                if (buffered < JITTER_BUFFER_PKTS)
+                {
+                    memcpy(jitterBuf[buffered++], rxBuf, samplesRead * sizeof(int16_t));
+                    continue;
+                }
+                // Drain the pre-fill buffer first
+                for (int p = 0; p < JITTER_BUFFER_PKTS; p++)
+                {
+                    for (int i = 0; i < SAMPLES_PER_PKT; i++)
+                    {
+                        stereoBuf[i * 2] = jitterBuf[p][i];
+                        stereoBuf[i * 2 + 1] = jitterBuf[p][i];
+                    }
+                    size_t bw;
+                    i2s_write(I2S_NUM_0, stereoBuf, SAMPLES_PER_PKT * 4, &bw, portMAX_DELAY);
+                }
+                buffered = 0;
+                playing = true;
             }
 
+            // Normal path: write directly to I2S
+            for (int i = 0; i < samplesRead; i++)
+            {
+                stereoBuf[i * 2] = rxBuf[i];
+                stereoBuf[i * 2 + 1] = rxBuf[i];
+            }
             size_t bytesWritten;
             i2s_write(I2S_NUM_0, stereoBuf, samplesRead * 4, &bytesWritten, portMAX_DELAY);
         }
@@ -243,6 +271,8 @@ void audioPlaybackTask(void *arg)
             if (isSpeaking && (millis() - lastPacketMs > 200))
             {
                 isSpeaking = false;
+                playing = false; // reset for next utterance
+                buffered = 0;
             }
             delay(1);
         }
