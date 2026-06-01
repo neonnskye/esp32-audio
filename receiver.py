@@ -46,6 +46,13 @@ NOISE_GATE = 0  # RMS threshold below which a packet is muted (0 = off)
 SILERO_VAD_THRESHOLD = 0.5  # Silero VAD speech probability threshold
 # -----------------------
 
+# ---- Recording Mode ----
+# Set True to capture mic passthrough audio for wake word dataset collection.
+# Disables wake word handling, VAD, STT, LLM, TTS, and all API calls.
+# Only mic → speaker passthrough remains active.
+RECORDING_MODE = False
+# ------------------------
+
 # Audio output routing
 AUDIO_OUTPUT = "esp32"  # "local" | "esp32" | "both"
 ESP32_IP = "172.20.10.3"  # must match IP printed by ESP32 on boot — adjust if different
@@ -213,6 +220,10 @@ def control_listener() -> None:
     """Listens on CTRL_PORT for wake word trigger packets from the ESP32."""
     global listen_state, bleed_remaining
 
+    if RECORDING_MODE:
+        print(f"{ts()} [RECORDING MODE] control_listener disabled.")
+        return
+
     last_wake_time = 0.0
     WAKE_COOLDOWN_S = 1.5
 
@@ -265,6 +276,10 @@ def load_silero_vad() -> None:
 
 def vad_accumulator_loop() -> None:
     global accumulator, silence_packets, listen_state, bleed_remaining
+
+    if RECORDING_MODE:
+        print(f"{ts()} [RECORDING MODE] vad_accumulator_loop disabled.")
+        return
 
     capture_start = 0.0  # timestamp when CAPTURING began
 
@@ -989,11 +1004,15 @@ def warmup_connections() -> None:
 
 
 def main() -> None:
-    print(
-        f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
-    )
-
-    load_silero_vad()
+    if RECORDING_MODE:
+        print(
+            f"{ts()} *** RECORDING MODE ACTIVE — all voice pipeline threads disabled ***"
+        )
+    else:
+        print(
+            f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
+        )
+        load_silero_vad()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
@@ -1004,22 +1023,29 @@ def main() -> None:
     threads = []
     for target, args in [
         (receive_loop, (sock,)),
-        (control_listener, ()),
-        (vad_accumulator_loop, ()),
-        (transcription_loop, ()),
-        (llm_loop, ()),
-        (tts_loop, ()),
-        (audio_dispatch_loop, ()),
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
         threads.append(t)
 
-    # Fire warmup in background — don't block startup or the pre-buffer wait
-    warmup_thread = threading.Thread(
-        target=warmup_connections, daemon=True, name="Warmup"
-    )
-    warmup_thread.start()
+    if not RECORDING_MODE:
+        for target, args in [
+            (control_listener, ()),
+            (vad_accumulator_loop, ()),
+            (transcription_loop, ()),
+            (llm_loop, ()),
+            (tts_loop, ()),
+            (audio_dispatch_loop, ()),
+        ]:
+            t = threading.Thread(target=target, args=args, daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Fire warmup in background — don't block startup or the pre-buffer wait
+        warmup_thread = threading.Thread(
+            target=warmup_connections, daemon=True, name="Warmup"
+        )
+        warmup_thread.start()
 
     print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     deadline = time.monotonic() + 10.0  # wait at most 10 seconds
