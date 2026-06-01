@@ -13,7 +13,7 @@
 // ---- User configuration ----
 #define WIFI_SSID "Amrith’s iPhone"
 #define WIFI_PASSWORD "brat summer"
-#define PC_IP "172.20.10.5"
+#define PC_IP "172.20.10.5" // 172.20.10.2 for Raspberry Pi
 #define UDP_PORT 12345
 #define CTRL_UDP_PORT 12346
 #define AUDIO_RX_PORT 12347      // PC sends TTS audio back to this port
