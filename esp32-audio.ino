@@ -22,6 +22,12 @@
 #define ESP32_CTRL_RX_PORT 12348 // PC sends control bytes (e.g. 0x02 "transcribing") to this port
 // ----------------------------
 
+// GPIO 2 is the standard built-in LED on most ESP32 devboards.
+// The generic ESP32_DEV variant does not define LED_BUILTIN, so we define it here.
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
 #define SAMPLES_PER_PKT 512
 
 // Double buffer: ISR writes to one half, main loop sends the other
@@ -434,12 +440,12 @@ void setup()
     // Listen for control bytes from PC (e.g. 0x02 "now transcribing" → play latency chime)
     xTaskCreatePinnedToCore(ctrlListenTask, "CtrlRX", 1024 * 4, NULL, 1, NULL, 1);
 
-    // Timer 0: 80 MHz / prescaler 5 = 16 MHz base clock
-    // Alarm at 1000 counts → 16 MHz / 1000 = exactly 16 000 Hz
-    timer = timerBegin(0, 5, true);
-    timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, 1000, true);
-    timerAlarmEnable(timer);
+    // v3 timer API: timerBegin takes the desired frequency directly (Hz).
+    // timerAlarm replaces timerAlarmWrite + timerAlarmEnable:
+    //   pass period = 1 tick at 16 000 Hz → fires at exactly 16 000 Hz.
+    timer = timerBegin(16000);             // 16 000 Hz timer clock
+    timerAttachInterrupt(timer, &onTimer); // no 'edge' argument in v3
+    timerAlarm(timer, 1, true, 0);         // fire every 1 tick = 16 000 Hz, auto-reload, unlimited
 
     Serial.println("Streaming audio...");
     Serial.print("Sent: ");
