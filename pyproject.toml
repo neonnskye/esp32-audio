@@ -14,22 +14,11 @@ dependencies = [
     "torchaudio>=2.11.0",
 ]
 
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
-    { index = "pytorch-cu130", marker = "platform_machine != 'aarch64' and sys_platform == 'win32'" },
-]
-torchaudio = [
-    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
-    { index = "pytorch-cu130", marker = "platform_machine != 'aarch64' and sys_platform == 'win32'" },
-]
-
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
