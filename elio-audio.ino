@@ -7,6 +7,8 @@
 #include "jbl_begin.h"
 #include "jbl_latency.h"
 
+#include <PubSubClient.h>
+
 #define EIDSP_QUANTIZE_FILTERBANK 0
 #include <Elio_Wake_v3_inferencing.h>
 
@@ -14,12 +16,15 @@
 #define WIFI_SSID "Amrith’s iPhone"
 #define WIFI_PASSWORD "brat summer"
 #define PC_IP "172.20.10.5" // 172.20.10.2 for Raspberry Pi
+#define MQTT_BROKER         PC_IP   // broker runs on same machine as receiver.py
+#define MQTT_PORT           1883
+#define MQTT_ID             "elio-esp32"
+#define TOPIC_WAKE          "elio/wake"
+#define TOPIC_CTRL          "elio/ctrl"
 #define UDP_PORT 12345
-#define CTRL_UDP_PORT 12346
 #define AUDIO_RX_PORT 12347      // PC sends TTS audio back to this port
 #define PLAYBACK_VOLUME_PCT 95   // volume scale applied to each sample (out of 100)
 #define CHIME_VOLUME_PCT 95      // volume scale applied to chime samples (out of 100)
-#define ESP32_CTRL_RX_PORT 12348 // PC sends control bytes (e.g. 0x02 "transcribing") to this port
 // ----------------------------
 
 // GPIO 2 is the standard built-in LED on most ESP32 devboards.
@@ -112,7 +117,9 @@ static int ei_get_data(size_t offset, size_t length, float *out_ptr)
 static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 
 WiFiUDP udp;
-WiFiUDP ctrlUdp;
+
+WiFiClient  wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 void playChime(const int16_t *samples,
                uint32_t length_bytes,
@@ -187,8 +194,8 @@ void inferenceTask(void *arg)
                     if (!isSpeaking)
                     {
                         // Turn on LED immediately; it will stay on until the
-                        // PC signals VAD end (0x03), at which point ctrlListenTask
-                        // turns it off.
+                        // PC signals "stop" via MQTT on elio/ctrl, at which point
+                        // mqttCallback turns it off.
                         isListening = true;
                         digitalWrite(LED_BUILTIN, HIGH);
 
@@ -196,10 +203,7 @@ void inferenceTask(void *arg)
                         // immediately. The chime plays after — its duration is
                         // covered by BLEED_SKIP_PACKETS on the receiver side,
                         // so no speech is lost.
-                        uint8_t trigByte = 0x01;
-                        ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
-                        ctrlUdp.write(&trigByte, 1);
-                        ctrlUdp.endPacket();
+                        mqttClient.publish(TOPIC_WAKE, "1");
 
                         playChime(jbl_begin, jbl_begin_length);
                     }
@@ -309,59 +313,64 @@ void chimeLoopTask(void *arg)
     vTaskDelete(NULL);
 }
 
-void ctrlListenTask(void *arg)
+void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
-    WiFiUDP ctrlRxUdp;
-    ctrlRxUdp.begin(ESP32_CTRL_RX_PORT);
+    // Build a null-terminated string from the payload bytes
+    char msg[32] = {0};
+    unsigned int copy = (length < sizeof(msg) - 1) ? length : sizeof(msg) - 1;
+    memcpy(msg, payload, copy);
 
-    while (true)
+    if (strcmp(topic, TOPIC_CTRL) != 0)
+        return; // ignore any topic we didn't subscribe to
+
+    if (strcmp(msg, "processing") == 0 && !isSpeaking)
     {
-        int packetSize = ctrlRxUdp.parsePacket();
-        if (packetSize > 0)
+        // Same logic as the old byte == 0x02 branch
+        chimeLooping = false;
+        while (chimeTaskHandle != NULL)
+            vTaskDelay(1);
+
+        chimeLooping = true;
+        xTaskCreatePinnedToCore(
+            chimeLoopTask,
+            "ChimeLoop",
+            1024 * 4,
+            NULL,
+            1,
+            &chimeTaskHandle,
+            1);
+    }
+    else if (strcmp(msg, "stop") == 0)
+    {
+        // Same logic as the old byte == 0x03 branch
+        chimeLooping = false;
+        while (chimeTaskHandle != NULL)
+            vTaskDelay(1);
+
+        i2s_zero_dma_buffer(I2S_NUM_0);
+
+        if (isListening)
         {
-            uint8_t byte = 0;
-            ctrlRxUdp.read(&byte, 1);
+            isListening = false;
+            digitalWrite(LED_BUILTIN, LOW);
+        }
+    }
+}
 
-            if (byte == 0x02 && !isSpeaking)
-            {
-                chimeLooping = false;
-                while (chimeTaskHandle != NULL)
-                {
-                    vTaskDelay(1);
-                }
-
-                chimeLooping = true;
-                xTaskCreatePinnedToCore(
-                    chimeLoopTask,
-                    "ChimeLoop",
-                    1024 * 4,
-                    NULL,
-                    1,
-                    &chimeTaskHandle,
-                    1);
-            }
-            else if (byte == 0x03)
-            {
-                chimeLooping = false;
-
-                while (chimeTaskHandle != NULL)
-                {
-                    vTaskDelay(1);
-                }
-
-                i2s_zero_dma_buffer(I2S_NUM_0);
-
-                // VAD has ended — user has stopped speaking, turn off listen LED
-                if (isListening)
-                {
-                    isListening = false;
-                    digitalWrite(LED_BUILTIN, LOW);
-                }
-            }
+void mqttReconnect()
+{
+    while (!mqttClient.connected())
+    {
+        Serial.print("Connecting to MQTT broker...");
+        if (mqttClient.connect(MQTT_ID))
+        {
+            Serial.println(" connected.");
+            mqttClient.subscribe(TOPIC_CTRL);
         }
         else
         {
-            delay(5);
+            Serial.printf(" failed (rc=%d). Retry in 2s.\n", mqttClient.state());
+            delay(2000);
         }
     }
 }
@@ -392,6 +401,11 @@ void setup()
 
     // Disable WiFi modem sleep to reduce ADC interference from radio bursts
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // MQTT setup — must be after WiFi is connected
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttReconnect();
 
     ei_inf.n_samples = EI_CLASSIFIER_SLICE_SIZE;
     ei_inf.buffers[0] = (int16_t *)malloc(EI_CLASSIFIER_SLICE_SIZE * sizeof(int16_t));
@@ -437,9 +451,6 @@ void setup()
     // Start audio playback task on core 1 (same as WiFi — spends most time blocked on UDP recv)
     xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 3, NULL, 1);
 
-    // Listen for control bytes from PC (e.g. 0x02 "now transcribing" → play latency chime)
-    xTaskCreatePinnedToCore(ctrlListenTask, "CtrlRX", 1024 * 4, NULL, 1, NULL, 1);
-
     // v3 timer API: timerBegin takes the desired frequency directly (Hz).
     // timerAlarm replaces timerAlarmWrite + timerAlarmEnable:
     //   pass period = 1 tick at 16 000 Hz → fires at exactly 16 000 Hz.
@@ -456,6 +467,10 @@ void setup()
 
 void loop()
 {
+    if (!mqttClient.connected())
+        mqttReconnect();
+    mqttClient.loop();
+
     if (readyBuf < 0)
     {
         delay(1);
