@@ -12,7 +12,7 @@
 #include <PubSubClient.h>
 
 #define EIDSP_QUANTIZE_FILTERBANK 0
-#include <Elio_Wake_v3_inferencing.h>
+#include <Elio_Wake_v3.1_inferencing.h>
 
 // ---- User configuration ----
 #define WIFI_SSID_1    "Amrith’s iPhone"
